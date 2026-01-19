@@ -1,34 +1,33 @@
 """
-Pleasance RunPod Serverless Handler
+Pleasance RunPod Serverless Handler (Async Parallel)
 
 Serverless endpoint for content generation and review.
-Deploy to RunPod Serverless for auto-scaling, no pod management.
+Uses asyncio for massive parallelism - all LLM calls run simultaneously.
 
-RunPod Serverless Setup:
-1. Create endpoint at runpod.io/serverless
-2. Use template: runpod/pytorch:2.1.0-py3.10-cuda12.1.1-devel
-3. Deploy this handler
-4. Call via API: POST https://api.runpod.ai/v2/{endpoint_id}/runsync
+Deploy to RunPod Serverless for auto-scaling.
 """
 
 import os
+import asyncio
 import runpod
-from proxy_client import AntigravityClient, FALLBACK_CHAINS
+import aiohttp
+from typing import Optional, Dict, Any, List
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# API endpoints
 PLEASANCE_API = os.environ.get("PLEASANCE_API", "https://api.pleasance.app")
 AGENT_SECRET = os.environ.get("AGENT_SECRET")
+PROXY_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://agproxy12461249316123.pleasance.app")
 
-# Proxy URL - for serverless, use the Cloudflare tunnel URL
-# Set this in RunPod environment variables
-PROXY_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://proxy.pleasance.app")
-
-# Initialize proxy client
-client = AntigravityClient(PROXY_URL)
+# Fallback chain for bulk generation
+FAST_CHAIN = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3-flash",
+    "claude-sonnet-4-5",
+]
 
 # =============================================================================
 # PROMPTS
@@ -63,84 +62,199 @@ Respond in JSON:
 """
 
 # =============================================================================
-# HANDLERS
+# ASYNC PROXY CLIENT
 # =============================================================================
 
-def generate_section(kink: dict, section_key: str) -> dict:
-    """Generate a single section for a kink."""
+class AsyncProxyClient:
+    """Async client for parallel LLM calls."""
+    
+    def __init__(self, base_url: str = None):
+        self.base_url = base_url or PROXY_URL
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=120)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    async def call_model(self, prompt: str, model: str, max_tokens: int = 2048) -> Optional[str]:
+        """Call a specific model through the proxy."""
+        try:
+            session = await self.get_session()
+            
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+            }
+            
+            async with session.post(
+                f"{self.base_url}/v1/messages",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    # Claude format
+                    if "content" in data and len(data["content"]) > 0:
+                        return data["content"][0].get("text", "")
+                    
+                    # Gemini format
+                    if "text" in data:
+                        return data["text"]
+                    
+            return None
+        except Exception as e:
+            print(f"[ERROR] {model}: {e}")
+            return None
+    
+    async def complete(self, prompt: str, models: List[str] = None) -> Dict[str, Any]:
+        """Complete with fallback chain."""
+        models = models or FAST_CHAIN
+        
+        for i, model in enumerate(models):
+            result = await self.call_model(prompt, model)
+            if result:
+                return {"text": result, "model": model, "success": True}
+            if i < len(models) - 1:
+                print(f"[FALLBACK] {model} failed, trying {models[i+1]}")
+        
+        return {"text": None, "model": None, "success": False, "error": "All models failed"}
+    
+    async def health_check(self) -> bool:
+        """Check if proxy is available."""
+        try:
+            session = await self.get_session()
+            async with session.get(f"{self.base_url}/health") as resp:
+                return resp.status == 200
+        except:
+            return False
+
+
+# Global client
+client = AsyncProxyClient()
+
+# =============================================================================
+# ASYNC GENERATION
+# =============================================================================
+
+async def generate_section_async(kink: dict, section_key: str) -> dict:
+    """Generate a single section for a kink (async)."""
     prompt_template = SECTION_PROMPTS.get(section_key)
     if not prompt_template:
-        return {"kinkId": kink.get("id"), "sectionKey": section_key, "error": f"Unknown section: {section_key}"}
+        return {
+            "kinkId": kink.get("id"),
+            "sectionKey": section_key,
+            "content": None,
+            "error": f"Unknown section: {section_key}"
+        }
     
     prompt = prompt_template.format(
         name=kink.get("name", "Unknown"),
         category=kink.get("category", "")
     )
     
-    print(f"[DEBUG] Generating {section_key} for {kink.get('name')}")
-    print(f"[DEBUG] Using proxy: {PROXY_URL}")
+    print(f"[GEN] {kink.get('name')} → {section_key}")
     
-    # Use fast chain for bulk generation
-    result = client.complete(prompt, chain="fast", max_tokens=1024)
+    result = await client.complete(prompt)
     
-    print(f"[DEBUG] Result success: {result.get('success')}")
-    if not result.get('success'):
-        print(f"[DEBUG] Error: {result.get('error')}")
-    
-    if result["success"]:
-        return {
-            "kinkId": kink["id"],
-            "sectionKey": section_key,
-            "content": result["text"],
-            "model": result["model"]
-        }
-    else:
-        return {
-            "kinkId": kink.get("id"),
-            "sectionKey": section_key,
-            "content": None,
-            "error": result.get("error", "All models failed")
-        }
+    return {
+        "kinkId": kink["id"],
+        "sectionKey": section_key,
+        "content": result.get("text"),
+        "model": result.get("model"),
+        "error": result.get("error") if not result["success"] else None
+    }
 
 
-def review_section(kink: dict, section_key: str, content: str) -> dict:
-    """Review a section for quality issues."""
+async def generate_batch_async(kinks: List[dict]) -> List[dict]:
+    """Generate all sections for all kinks in parallel."""
+    tasks = []
+    
+    for kink in kinks:
+        for section_key in SECTION_PROMPTS.keys():
+            tasks.append(generate_section_async(kink, section_key))
+    
+    print(f"[BATCH] Starting {len(tasks)} parallel LLM calls...")
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Handle any exceptions
+    sections = []
+    for r in results:
+        if isinstance(r, Exception):
+            sections.append({"error": str(r)})
+        else:
+            sections.append(r)
+    
+    print(f"[BATCH] Completed {len(sections)} sections")
+    return sections
+
+
+async def review_section_async(item: dict) -> dict:
+    """Review a section (async)."""
     prompt = REVIEW_PROMPT.format(
-        name=kink.get("name", "Unknown"),
-        section_key=section_key,
-        content=content
+        name=item.get("name", "Unknown"),
+        section_key=item.get("sectionKey"),
+        content=item.get("content", "")
     )
     
-    # Use standard chain for review (needs Claude quality)
-    result = client.complete_json(prompt, chain="standard")
+    result = await client.complete(prompt)
     
-    if result:
-        result["kinkId"] = kink["id"]
-        result["sectionKey"] = section_key
-        result["model"] = "unknown"  # JSON parse loses this
-        return result
-    else:
-        return {"approved": True, "error": "Review failed, auto-approved"}
+    if result["success"]:
+        try:
+            import json
+            text = result["text"]
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                review = json.loads(text[start:end])
+                review["kinkId"] = item.get("kinkId")
+                review["sectionKey"] = item.get("sectionKey")
+                return review
+        except:
+            pass
+    
+    return {
+        "kinkId": item.get("kinkId"),
+        "sectionKey": item.get("sectionKey"),
+        "approved": True,
+        "error": "Review parse failed"
+    }
 
+
+async def review_batch_async(items: List[dict]) -> List[dict]:
+    """Review all items in parallel."""
+    print(f"[REVIEW] Starting {len(items)} parallel reviews...")
+    
+    tasks = [review_section_async(item) for item in items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    reviews = []
+    for r in results:
+        if isinstance(r, Exception):
+            reviews.append({"approved": True, "error": str(r)})
+        else:
+            reviews.append(r)
+    
+    return reviews
+
+# =============================================================================
+# RUNPOD HANDLER
+# =============================================================================
 
 def handler(job: dict) -> dict:
     """
-    RunPod Serverless Handler
+    RunPod Serverless Handler (Async Parallel)
     
-    Input:
-    {
-        "input": {
-            "action": "generate" | "review" | "batch_generate",
-            "kink": {...} | "kinks": [...],
-            "sectionKey": "appeal" | "howTo" | "variations",
-            "content": "..." (for review only)
-        }
-    }
-    
-    Output:
-    {
-        "sections": [...] | "reviews": [...] | "error": "..."
-    }
+    All LLM calls run simultaneously for maximum throughput.
     """
     try:
         input_data = job.get("input", {})
@@ -148,55 +262,60 @@ def handler(job: dict) -> dict:
         
         # Health check
         if action == "health":
-            proxy_ok = client.health_check()
-            return {"status": "ok", "proxy": proxy_ok}
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                proxy_ok = loop.run_until_complete(client.health_check())
+                return {"status": "ok", "proxy": proxy_ok, "mode": "async_parallel"}
+            finally:
+                loop.run_until_complete(client.close())
+                loop.close()
         
-        # Single section generation
+        # Batch generation (parallel)
+        if action == "batch_generate":
+            kinks = input_data.get("kinks", [])
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                sections = loop.run_until_complete(generate_batch_async(kinks))
+                return {"sections": sections, "count": len(sections)}
+            finally:
+                loop.run_until_complete(client.close())
+                loop.close()
+        
+        # Batch review (parallel)
+        if action == "batch_review":
+            items = input_data.get("items", [])
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                reviews = loop.run_until_complete(review_batch_async(items))
+                return {"reviews": reviews, "count": len(reviews)}
+            finally:
+                loop.run_until_complete(client.close())
+                loop.close()
+        
+        # Single generation (for testing)
         if action == "generate":
             kink = input_data.get("kink", {})
             section_key = input_data.get("sectionKey", "appeal")
-            result = generate_section(kink, section_key)
-            return {"section": result}
-        
-        # Batch generation (multiple kinks, all sections)
-        if action == "batch_generate":
-            kinks = input_data.get("kinks", [])
-            sections = []
             
-            for kink in kinks:
-                for section_key in SECTION_PROMPTS.keys():
-                    result = generate_section(kink, section_key)
-                    sections.append(result)
-            
-            return {"sections": sections, "count": len(sections)}
-        
-        # Review a section
-        if action == "review":
-            kink = input_data.get("kink", {})
-            section_key = input_data.get("sectionKey")
-            content = input_data.get("content", "")
-            result = review_section(kink, section_key, content)
-            return {"review": result}
-        
-        # Batch review
-        if action == "batch_review":
-            items = input_data.get("items", [])
-            reviews = []
-            
-            for item in items:
-                result = review_section(
-                    {"id": item["kinkId"], "name": item.get("name", "")},
-                    item["sectionKey"],
-                    item["content"]
-                )
-                reviews.append(result)
-            
-            return {"reviews": reviews, "count": len(reviews)}
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(generate_section_async(kink, section_key))
+                return {"section": result}
+            finally:
+                loop.run_until_complete(client.close())
+                loop.close()
         
         return {"error": f"Unknown action: {action}"}
         
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # RunPod Serverless entry point
