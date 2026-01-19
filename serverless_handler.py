@@ -70,15 +70,22 @@ def generate_section(kink: dict, section_key: str) -> dict:
     """Generate a single section for a kink."""
     prompt_template = SECTION_PROMPTS.get(section_key)
     if not prompt_template:
-        return {"error": f"Unknown section: {section_key}"}
+        return {"kinkId": kink.get("id"), "sectionKey": section_key, "error": f"Unknown section: {section_key}"}
     
     prompt = prompt_template.format(
         name=kink.get("name", "Unknown"),
         category=kink.get("category", "")
     )
     
+    print(f"[DEBUG] Generating {section_key} for {kink.get('name')}")
+    print(f"[DEBUG] Using proxy: {PROXY_URL}")
+    
     # Use fast chain for bulk generation
     result = client.complete(prompt, chain="fast", max_tokens=1024)
+    
+    print(f"[DEBUG] Result success: {result.get('success')}")
+    if not result.get('success'):
+        print(f"[DEBUG] Error: {result.get('error')}")
     
     if result["success"]:
         return {
@@ -88,7 +95,12 @@ def generate_section(kink: dict, section_key: str) -> dict:
             "model": result["model"]
         }
     else:
-        return {"error": "All models failed", "kinkId": kink["id"]}
+        return {
+            "kinkId": kink.get("id"),
+            "sectionKey": section_key,
+            "content": None,
+            "error": result.get("error", "All models failed")
+        }
 
 
 def review_section(kink: dict, section_key: str, content: str) -> dict:

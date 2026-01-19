@@ -1,0 +1,10 @@
+# Cloudflare Tunnel Configuration
+# Fixed: Uses new pleasance-proxy tunnel
+
+tunnel: 8b06e40d-15ea-46f5-80b4-09706482562d
+credentials-file: C:\Users\yannp\.cloudflared\8b06e40d-15ea-46f5-80b4-09706482562d.json
+
+ingress:
+  - hostname: agproxy12461249316123.pleasance.app
+    service: http://localhost:8080
+  - service: http_status:404
