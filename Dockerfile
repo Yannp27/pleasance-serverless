@@ -1,17 +1,15 @@
 # RunPod Serverless Dockerfile
 
-FROM runpod/pytorch:2.1.0-py3.10-cuda12.1.1-devel
+FROM python:3.10-slim
 
 WORKDIR /app
 
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install runpod
 
-# Copy agent code
-COPY proxy_client.py .
-COPY serverless_handler.py .
+# Copy handler
+COPY proxy_client.py serverless_handler.py ./
 
-# RunPod expects handler at /app
+# RunPod handler entrypoint
 CMD ["python", "-u", "serverless_handler.py"]
